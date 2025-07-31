@@ -916,3 +916,214 @@ func initTables(ctx context.Context, con *pgx.Conn, migration string) error {
 	_, err := con.Exec(ctx, migration)
 	return err
 }
+
+func Test_AutoAnonymize(t *testing.T) {
+	ctx := context.Background()
+	// Start the PostgreSQL container
+	connStr, cleanup, err := runPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer cleanup() // Ensure the container is terminated after the test
+
+	con, err := pgx.Connect(ctx, connStr)
+	require.NoError(t, err)
+	defer con.Close(ctx)
+
+	err = initTables(ctx, con, configBuilderTestDb)
+	require.NoError(t, err)
+
+	pgVer := testContainerPgVersion
+	tx, err := con.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx) // nolint: errcheck
+
+	opt := &pgdump.Options{}
+	typeMap := tx.Conn().TypeMap()
+	types, err := buildTypeMap(ctx, tx, typeMap)
+	require.NoError(t, err)
+
+	t.Run("AutoAnonymize enabled", func(t *testing.T) {
+		tables, _, _, err := getDumpObjects(ctx, pgVer, tx, opt)
+		require.NoError(t, err)
+		graph, err := subset.NewGraph(ctx, tx, tables, nil)
+		require.NoError(t, err)
+
+		cfg := &domains.Dump{
+			AutoAnonymize: true, // Enable auto-anonymization globally
+			Transformation: []*domains.Table{
+				{
+					Schema: "public",
+					Name:   "users",
+					Transformers: []*domains.TransformerConfig{
+						{
+							Name: transformers.RandomStringTransformerName,
+							Params: toolkit.StaticParameters{
+								"column":     toolkit.ParamsValue("username"),
+								"min_length": toolkit.ParamsValue("5"),
+								"max_length": toolkit.ParamsValue("10"),
+							},
+						},
+					},
+				},
+			},
+		}
+
+		vw, err := validateAndBuildEntriesConfig(
+			ctx, tx, tables, typeMap, cfg,
+			utils.DefaultTransformerRegistry, pgVer, types, graph,
+		)
+		require.NoError(t, err)
+		require.False(t, vw.IsFatal())
+
+		// Find users table
+		var usersTable *entries.Table
+		for _, table := range tables {
+			if table.Name == "users" && table.Schema == "public" {
+				usersTable = table
+				break
+			}
+		}
+		require.NotNil(t, usersTable, "users table should exist")
+
+		// Should have transformers for both defined (username) and undefined columns (id should get RandomInt)
+		assert.GreaterOrEqual(t, len(usersTable.TransformersContext), 2, "Should have transformers for both defined and undefined columns")
+
+		// Verify that we have transformers for both id and username columns
+		transformerColumns := make(map[string]string) // column -> transformer name
+		for _, ctx := range usersTable.TransformersContext {
+			// Get column name from transformer parameters
+			if columnParam, ok := ctx.StaticParameters["column"]; ok {
+				if value, err := columnParam.Value(); err == nil {
+					if columnName, ok := value.(string); ok {
+						// For transformer name, we'll just check the static parameters exist
+						transformerColumns[columnName] = "transformer_found"
+					}
+				}
+			}
+		}
+
+		assert.Contains(t, transformerColumns, "username", "Should have transformer for explicitly defined username column")
+		assert.Contains(t, transformerColumns, "id", "Should have default transformer for undefined id column")
+	})
+
+	t.Run("SkipAutoAnonymize for specific columns", func(t *testing.T) {
+		tables, _, _, err := getDumpObjects(ctx, pgVer, tx, opt)
+		require.NoError(t, err)
+		graph, err := subset.NewGraph(ctx, tx, tables, nil)
+		require.NoError(t, err)
+
+		cfg := &domains.Dump{
+			AutoAnonymize: true, // Enable auto-anonymization globally
+			Transformation: []*domains.Table{
+				{
+					Schema:            "public",
+					Name:              "users",
+					SkipAutoAnonymize: []string{"id"}, // Skip auto-anonymization for id column
+					Transformers: []*domains.TransformerConfig{
+						{
+							Name: transformers.RandomStringTransformerName,
+							Params: toolkit.StaticParameters{
+								"column":     toolkit.ParamsValue("username"),
+								"min_length": toolkit.ParamsValue("5"),
+								"max_length": toolkit.ParamsValue("10"),
+							},
+						},
+					},
+				},
+			},
+		}
+
+		vw, err := validateAndBuildEntriesConfig(
+			ctx, tx, tables, typeMap, cfg,
+			utils.DefaultTransformerRegistry, pgVer, types, graph,
+		)
+		require.NoError(t, err)
+		require.False(t, vw.IsFatal())
+
+		// Find users table
+		var usersTable *entries.Table
+		for _, table := range tables {
+			if table.Name == "users" && table.Schema == "public" {
+				usersTable = table
+				break
+			}
+		}
+		require.NotNil(t, usersTable, "users table should exist")
+
+		// Should have transformer for username but NOT for id (since id is in SkipAutoAnonymize)
+		transformerColumns := make(map[string]string)
+		for _, ctx := range usersTable.TransformersContext {
+			if columnParam, ok := ctx.StaticParameters["column"]; ok {
+				if value, err := columnParam.Value(); err == nil {
+					if columnName, ok := value.(string); ok {
+						transformerColumns[columnName] = "transformer_found"
+					}
+				}
+			}
+		}
+
+		assert.Contains(t, transformerColumns, "username", "Should have transformer for explicitly defined username column")
+		assert.NotContains(t, transformerColumns, "id", "Should NOT have transformer for id column since it's in SkipAutoAnonymize")
+	})
+
+	t.Run("AutoAnonymize disabled", func(t *testing.T) {
+		tables, _, _, err := getDumpObjects(ctx, pgVer, tx, opt)
+		require.NoError(t, err)
+		graph, err := subset.NewGraph(ctx, tx, tables, nil)
+		require.NoError(t, err)
+
+		cfg := &domains.Dump{
+			AutoAnonymize: false, // Disable auto-anonymization globally
+			Transformation: []*domains.Table{
+				{
+					Schema: "public",
+					Name:   "users",
+					Transformers: []*domains.TransformerConfig{
+						{
+							Name: transformers.RandomStringTransformerName,
+							Params: toolkit.StaticParameters{
+								"column":     toolkit.ParamsValue("username"),
+								"min_length": toolkit.ParamsValue("5"),
+								"max_length": toolkit.ParamsValue("10"),
+							},
+						},
+					},
+				},
+			},
+		}
+
+		vw, err := validateAndBuildEntriesConfig(
+			ctx, tx, tables, typeMap, cfg,
+			utils.DefaultTransformerRegistry, pgVer, types, graph,
+		)
+		require.NoError(t, err)
+		require.False(t, vw.IsFatal())
+
+		// Find users table
+		var usersTable *entries.Table
+		for _, table := range tables {
+			if table.Name == "users" && table.Schema == "public" {
+				usersTable = table
+				break
+			}
+		}
+		require.NotNil(t, usersTable, "users table should exist")
+
+		// Should only have transformer for explicitly defined column (username)
+		assert.Equal(t, 1, len(usersTable.TransformersContext), "Should only have transformer for explicitly defined column")
+
+		// Verify that only username has a transformer
+		transformerColumns := make(map[string]string)
+		for _, ctx := range usersTable.TransformersContext {
+			if columnParam, ok := ctx.StaticParameters["column"]; ok {
+				if value, err := columnParam.Value(); err == nil {
+					if columnName, ok := value.(string); ok {
+						transformerColumns[columnName] = "transformer_found"
+					}
+				}
+			}
+		}
+
+		assert.Contains(t, transformerColumns, "username", "Should have transformer for explicitly defined username column")
+		assert.NotContains(t, transformerColumns, "id", "Should not have transformer for undefined id column when disabled")
+	})
+}

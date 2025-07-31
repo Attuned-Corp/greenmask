@@ -2,6 +2,7 @@ package context
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"slices"
@@ -122,7 +123,7 @@ func validateAndBuildEntriesConfig(
 		setColumnTypeOverrides(cfgMapping.entry, cfgMapping.config, typeMap)
 
 		// Set transformers for the table
-		transformersInitWarns, err := initAndSetupTransformers(ctx, cfgMapping.entry, cfgMapping.config, r)
+		transformersInitWarns, err := initAndSetupTransformers(ctx, cfgMapping.entry, cfgMapping.config, cfg, r)
 		enrichWarningsWithTableName(transformersInitWarns, cfgMapping.entry)
 		warnings = append(warnings, transformersInitWarns...)
 		if err != nil {
@@ -579,13 +580,142 @@ func enrichWarningsWithTransformerName(warns toolkit.ValidationWarnings, n strin
 	}
 }
 
-func initAndSetupTransformers(ctx context.Context, t *entries.Table, cfg *domains.Table, r *transformersUtils.TransformerRegistry,
+func generateDefaultTransformersForUndefinedColumns(t *entries.Table, tableConfig *domains.Table, dumpConfig *domains.Dump) ([]*domains.TransformerConfig, error) {
+	var defaultTransformers []*domains.TransformerConfig
+
+	// Create a set of columns that already have transformers configured
+	definedColumns := make(map[string]bool)
+	for _, transformer := range tableConfig.Transformers {
+		// Extract column names from transformer parameters
+		columnNames, err := extractColumnNamesFromTransformer(transformer, transformersUtils.DefaultTransformerRegistry)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract column names from transformer %s: %w", transformer.Name, err)
+		}
+		for _, colName := range columnNames {
+			definedColumns[colName] = true
+		}
+	}
+
+	// Create a set of columns to skip from the table-level configuration
+	skipColumns := make(map[string]bool)
+	for _, colName := range tableConfig.SkipAutoAnonymize {
+		skipColumns[colName] = true
+	}
+
+	// For each column in the table, check if it needs a default transformer
+	for _, column := range t.Columns {
+		// Skip columns that already have transformers
+		if definedColumns[column.Name] {
+			continue
+		}
+
+		// Skip columns listed in SkipAutoAnonymize
+		if skipColumns[column.Name] {
+			continue
+		}
+
+		// Skip generated columns as they shouldn't be transformed
+		if column.IsGenerated {
+			continue
+		}
+
+		// Skip primary key columns from being transformed
+		if slices.Contains(t.PrimaryKey, column.Name) {
+			continue
+		}
+
+		// Get default transformer for this column type
+		defaultTransformer, err := transformers.GetDefaultTransformerForColumn(column)
+		if err != nil {
+			return nil, fmt.Errorf("error getting default transformer for column %s: %w", column.Name, err)
+		}
+		if defaultTransformer != nil {
+			defaultTransformers = append(defaultTransformers, defaultTransformer)
+			log.Debug().
+				Str("TableSchema", t.Schema).
+				Str("TableName", t.Name).
+				Str("ColumnName", column.Name).
+				Str("ColumnType", column.TypeName).
+				Str("DefaultTransformer", defaultTransformer.Name).
+				Msg("applying default transformer for undefined column")
+		}
+	}
+
+	return defaultTransformers, nil
+}
+
+func extractColumnNamesFromTransformer(transformer *domains.TransformerConfig, registry *transformersUtils.TransformerRegistry) ([]string, error) {
+	var columnNames []string
+
+	// Get transformer definition from registry
+	transformerDef, ok := registry.Get(transformer.Name)
+	if !ok {
+		return nil, fmt.Errorf("transformer %s not found in registry", transformer.Name)
+	}
+
+	// Iterate through parameter definitions to find column-related parameters
+	for _, paramDef := range transformerDef.Parameters {
+		if paramDef.IsColumn {
+			// Single column parameter
+			if paramValue, exists := transformer.Params[paramDef.Name]; exists {
+				columnName := string(paramValue)
+				columnNames = append(columnNames, columnName)
+			}
+		} else if paramDef.IsColumnContainer {
+			// Multi-column parameter - need to parse the structure
+			if paramValue, exists := transformer.Params[paramDef.Name]; exists {
+				// For column containers, we need to extract column names from the parameter value
+				// This could be a JSON array or other structure depending on the transformer
+				containerColumns, err := extractColumnNamesFromParam(paramValue)
+				if err != nil {
+					return nil, fmt.Errorf("failed to extract columns from container parameter %s: %w", paramDef.Name, err)
+				}
+				columnNames = append(columnNames, containerColumns...)
+			}
+		}
+	}
+
+	return columnNames, nil
+}
+
+func extractColumnNamesFromParam(param toolkit.ParamsValue) ([]string, error) {
+	// Try to unmarshal as JSON array of objects with a "name" field
+	var columnDefs []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(param, &columnDefs); err == nil && len(columnDefs) > 0 {
+		var columns []string
+		for _, col := range columnDefs {
+			if col.Name != "" {
+				columns = append(columns, col.Name)
+			}
+		}
+		return columns, nil
+	}
+
+	// For complex structures that we can't easily parse, we'll be conservative
+	// and return empty to avoid accidentally interfering with complex transformers
+	return []string{}, nil
+}
+
+func initAndSetupTransformers(ctx context.Context, t *entries.Table, tableConfig *domains.Table, dumpConfig *domains.Dump, r *transformersUtils.TransformerRegistry,
 ) (toolkit.ValidationWarnings, error) {
 	var warnings toolkit.ValidationWarnings
-	if len(cfg.Transformers) == 0 {
+
+	// If AutoAnonymize is enabled globally, add default transformers for columns without explicit transformers
+	if dumpConfig.AutoAnonymize {
+		defaultTransformers, err := generateDefaultTransformersForUndefinedColumns(t, tableConfig, dumpConfig)
+		if err != nil {
+			return nil, fmt.Errorf("cannot generate default transformers for undefined columns: %w", err)
+		}
+		tableConfig.Transformers = append(tableConfig.Transformers, defaultTransformers...)
+	}
+
+	if len(tableConfig.Transformers) == 0 {
 		return nil, nil
 	}
-	for _, tc := range cfg.Transformers {
+
+	for _, tc := range tableConfig.Transformers {
 		transformationCtx, initWarnings, err := initTransformer(ctx, t.Driver, tc, r)
 		enrichWarningsWithTransformerName(initWarnings, tc.Name)
 		if err != nil {
