@@ -95,6 +95,7 @@ type LogConfig struct {
 
 type Dump struct {
 	PgDumpOptions     pgdump.Options      `mapstructure:"pg_dump_options" yaml:"pg_dump_options" json:"pg_dump_options"`
+	AutoAnonymize     bool                `mapstructure:"auto_anonymize" yaml:"auto_anonymize" json:"auto_anonymize,omitempty"`
 	Transformation    []*Table            `mapstructure:"transformation" yaml:"transformation" json:"transformation,omitempty"`
 	VirtualReferences []*VirtualReference `mapstructure:"virtual_references" yaml:"virtual_references" json:"virtual_references,omitempty"`
 }
@@ -159,6 +160,7 @@ type Table struct {
 	Name                string               `mapstructure:"name" yaml:"name" json:"name,omitempty"`
 	Query               string               `mapstructure:"query" yaml:"query" json:"query,omitempty"`
 	ApplyForInherited   bool                 `mapstructure:"apply_for_inherited" yaml:"apply_for_inherited" json:"apply_for_inherited,omitempty"`
+	SkipAutoAnonymize   []string             `mapstructure:"skip_auto_anonymize" yaml:"skip_auto_anonymize" json:"skip_auto_anonymize,omitempty"`
 	Transformers        []*TransformerConfig `mapstructure:"transformers" yaml:"transformers" json:"transformers,omitempty"`
 	ColumnsTypeOverride map[string]string    `mapstructure:"columns_type_override" yaml:"columns_type_override" json:"columns_type_override,omitempty"`
 	SubsetConds         []string             `mapstructure:"subset_conds" yaml:"subset_conds" json:"subset_conds,omitempty"`
