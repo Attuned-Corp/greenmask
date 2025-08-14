@@ -11,19 +11,24 @@ import (
 type cteQuery struct {
 	items []*cteItem
 	c     *Component
+	// names keeps track of already added CTE names to avoid duplicates in WITH list
+	names map[string]bool
 }
 
 func newCteQuery(c *Component) *cteQuery {
 	return &cteQuery{
-		c: c,
+		c:     c,
+		names: make(map[string]bool),
 	}
 }
 
 func (c *cteQuery) addItem(name, query string) {
-	c.items = append(c.items, &cteItem{
-		name:  name,
-		query: query,
-	})
+	if c.names[name] {
+		// Already added; skip to prevent "WITH query name ... specified more than once"
+		return
+	}
+	c.items = append(c.items, &cteItem{name: name, query: query})
+	c.names[name] = true
 }
 
 func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
@@ -52,13 +57,18 @@ func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 		leftTableKeys = append(leftTableKeys, fmt.Sprintf(`"%s"."%s"."%s"`, targetTable.Schema, targetTable.Name, key))
 		rightTableKeys = append(rightTableKeys, fmt.Sprintf(`"%s"."%s"`, rightTableName, key))
 	}
+	leftKeysCSV := strings.Join(leftTableKeys, ",")
+	rightKeysCSV := strings.Join(rightTableKeys, ",")
+	// Build explicit non-generated column list using shared helper
+	selectClause := generateSelectAllColumns(targetTable)
 
 	resultingQuery := fmt.Sprintf(
-		`SELECT * FROM "%s"."%s" WHERE %s IN (SELECT %s FROM "%s")`,
+		`%s FROM "%s"."%s" WHERE (%s) IN (SELECT %s FROM "%s")`,
+		selectClause,
 		targetTable.Schema,
 		targetTable.Name,
-		fmt.Sprintf("(%s)", strings.Join(leftTableKeys, ",")),
-		strings.Join(rightTableKeys, ","),
+		leftKeysCSV,
+		rightKeysCSV,
 		rightTableName,
 	)
 	res := fmt.Sprintf("WITH RECURSIVE %s %s", strings.Join(queries, ","), resultingQuery)
