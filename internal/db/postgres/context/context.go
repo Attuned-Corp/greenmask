@@ -130,6 +130,10 @@ func NewRuntimeContext(
 		dataSectionObjects = append(dataSectionObjects, seq)
 	}
 	for _, table := range tables {
+		// If auto anonymize is enabled, only dump data for tables that are defined in configuration
+		if cfg.AutoAnonymize && !table.DefinedInConfig {
+			continue
+		}
 		dataSectionObjects = append(dataSectionObjects, table)
 	}
 	if blobs != nil {

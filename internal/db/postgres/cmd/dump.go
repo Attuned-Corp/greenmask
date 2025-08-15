@@ -381,7 +381,9 @@ func (d *Dump) setDumpDependenciesGraph(tables []*entries.Table) {
 			return entry.Oid == oid || entry.RootPtOid == oid
 		})
 		if idx == -1 {
-			panic(fmt.Sprintf("table not found: oid=%d", oid))
+			log.Debug().Msgf("table not found: oid=%d", oid)
+			// Table is not present in data entries (likely filtered out). Skip building deps for it.
+			continue
 		}
 		t := tables[idx]
 		// Create dependencies graph with DumpId sequence for easier restoration coordination
@@ -396,7 +398,9 @@ func (d *Dump) setDumpDependenciesGraph(tables []*entries.Table) {
 				return depTable.Oid == depOid
 			})
 			if depIdx == -1 {
-				panic("table not found")
+				log.Debug().Msgf("dependency not found: oid=%d", depOid)
+				// Dependency is not in data entries (likely filtered out)
+				continue
 			}
 			// Append dependency table DumpId to the current table dependencies
 			d.dumpDependenciesGraph[t.DumpId] = append(d.dumpDependenciesGraph[t.DumpId], tables[depIdx].DumpId)
