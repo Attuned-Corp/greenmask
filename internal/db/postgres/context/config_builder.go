@@ -76,6 +76,8 @@ func validateAndBuildEntriesConfig(
 	}
 	warnings = append(warnings, setConfigWarns...)
 	for _, cfgMapping := range entriesWithTransformers {
+		// Mark table as defined in configuration (explicitly or via inheritance/reference expansion)
+		cfgMapping.entry.DefinedInConfig = true
 		// set subset conditions
 		setSubsetConds(cfgMapping.entry, cfgMapping.config)
 		// set query

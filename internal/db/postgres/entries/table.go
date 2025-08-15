@@ -49,6 +49,9 @@ type Table struct {
 	Scores      int64
 	SubsetConds []string
 	When        *toolkit.WhenCond
+	// DefinedInConfig indicates the table was selected/defined by the configuration (explicitly or via
+	// configuration-driven inheritance like apply_for_inherited/apply_for_references)
+	DefinedInConfig bool
 }
 
 // HasCustomTransformer - check if table has custom transformer
