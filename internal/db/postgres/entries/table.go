@@ -145,6 +145,23 @@ func (t *Table) Entry() (*toc.Entry, error) {
 	}, nil
 }
 
+// SelectColumns returns a comma-separated list of fully-qualified column names
+// for use in SELECT statements, excluding generated columns to match the
+// column list used by COPY FROM during restore.
+func (t *Table) SelectColumns() string {
+	columns := make([]string, 0, len(t.Columns))
+	for _, column := range t.Columns {
+		if !column.IsGenerated {
+			columns = append(columns, fmt.Sprintf(`"%s"."%s"."%s"`, t.Schema, t.Name, column.Name))
+		}
+	}
+	if len(columns) == 0 {
+		// Fallback to * if no column info available
+		return fmt.Sprintf(`"%s"."%s".*`, t.Schema, t.Name)
+	}
+	return strings.Join(columns, ", ")
+}
+
 // GetCopyFromStatement - get COPY FROM statement for table
 func (t *Table) GetCopyFromStatement() (string, error) {
 	// We could generate an explicit column list for the COPY statement, but it’s not necessary because, by default,

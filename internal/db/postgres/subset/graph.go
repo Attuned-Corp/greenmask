@@ -434,7 +434,7 @@ func (g *Graph) getOverlapMap(cycles [][]*Edge) map[string][][]*Edge {
 
 func (g *Graph) generateQueriesForVertexesInCycle(cq *cteQuery, scopeId int, cycles [][]*Edge) {
 	for _, t := range getTablesFromCycle(cycles[0]) {
-		queryName := fmt.Sprintf("%s__%s__ids", t.Schema, t.Name)
+		queryName := fmt.Sprintf("__s%d__%s__%s__ids", scopeId, t.Schema, t.Name)
 		query := generateAllTablesValidPkSelection(cycles, scopeId, t)
 		cq.addItem(queryName, query)
 	}
@@ -449,7 +449,7 @@ func (g *Graph) generateRecursiveQueriesForCycle(
 
 	for _, se := range nextScopeEdges {
 		t := se.originalCondensedEdge.originalEdge.to.table
-		overriddenTableNames[t.Oid] = fmt.Sprintf("%s__%s__ids", t.Schema, t.Name)
+		overriddenTableNames[t.Oid] = fmt.Sprintf("__s%d__%s__%s__ids", se.scopeId, t.Schema, t.Name)
 		rest = append(rest, se.originalCondensedEdge)
 	}
 
@@ -504,24 +504,7 @@ func (g *Graph) generateQueriesDfs(path *Path, scopeEdge *ScopeEdge) string {
 		return ""
 	}
 
-	currentScopeQuery := g.generateQueryForTables(path, scopeEdge)
-	var subQueries []string
-	for _, nextScope := range path.scopeGraph[scopeId] {
-		subQuery := g.generateQueriesDfs(path, nextScope)
-		if subQuery != "" {
-			subQueries = append(subQueries, subQuery)
-		}
-	}
-
-	if len(subQueries) == 0 {
-		return currentScopeQuery
-	}
-
-	totalQuery := fmt.Sprintf(
-		"%s AND %s", currentScopeQuery,
-		strings.Join(subQueries, " AND "),
-	)
-	return totalQuery
+	return g.generateQueryForTables(path, scopeEdge)
 }
 
 func (g *Graph) generateQueryForTables(path *Path, scopeEdge *ScopeEdge) string {
@@ -545,16 +528,28 @@ func (g *Graph) generateQueryForTables(path *Path, scopeEdge *ScopeEdge) string 
 	}
 
 	whereConds := slices.Clone(rootTable.SubsetConds)
-	selectClause := fmt.Sprintf(`SELECT "%s"."%s".*`, rootTable.Schema, rootTable.Name)
+	selectClause := fmt.Sprintf(`SELECT %s`, rootTable.SelectColumns())
 	if scopeEdge != nil {
 		selectClause = generateSelectByPrimaryKey(rootTable, rootTable.PrimaryKey)
 	}
 	fromClause := fmt.Sprintf(`FROM "%s"."%s" `, rootTable.Schema, rootTable.Name)
 
 	var joinClauses []string
+	var joinableEdges []*Edge
+
+	// Track which tables are available in the FROM clause (root + JOINed tables).
+	// Edges whose from.table is not available cannot be JOINed — they are
+	// silently dropped because their filtering effect is already captured
+	// by scope subqueries on the tables they reference.
+	availableTables := map[toolkit.Oid]bool{rootTable.Oid: true}
 
 	nullabilityMap := make(map[int]bool)
 	for _, e := range edges {
+		if !availableTables[e.from.table.Oid] {
+			// The from table is not in FROM/JOIN chain — skip this edge.
+			// Its filtering is handled by scope subqueries on the referenced tables.
+			continue
+		}
 		isNullable := e.isNullable
 		if !isNullable {
 			isNullable = nullabilityMap[e.from.idx]
@@ -566,16 +561,29 @@ func (g *Graph) generateQueryForTables(path *Path, scopeEdge *ScopeEdge) string 
 		}
 		joinClause := generateJoinClauseV2(e, joinType, make(map[toolkit.Oid]string))
 		joinClauses = append(joinClauses, joinClause)
+		joinableEdges = append(joinableEdges, e)
+		availableTables[e.to.table.Oid] = true
 	}
-	integrityChecks := generateIntegrityChecksForNullableEdges(nullabilityMap, edges, make(map[toolkit.Oid]string))
+	integrityChecks := generateIntegrityChecksForNullableEdges(nullabilityMap, joinableEdges, make(map[toolkit.Oid]string))
 	whereConds = append(whereConds, integrityChecks...)
 
-	query := fmt.Sprintf(
-		`%s %s %s %s`,
-		selectClause,
-		fromClause,
-		strings.Join(joinClauses, " "),
-		generateWhereClause(whereConds),
+	// Generate child scope subqueries. Only include scopes whose from.table
+	// is available in the current FROM clause. Scopes referencing unavailable
+	// tables are dropped — their filtering is already captured by the FK chain
+	// through scope subqueries that ARE available.
+	for _, nextScope := range path.scopeGraph[scopeId] {
+		fromTable := nextScope.originalCondensedEdge.originalEdge.from.table
+		if !availableTables[fromTable.Oid] {
+			continue
+		}
+		subQuery := g.generateQueriesDfs(path, nextScope)
+		if subQuery != "" {
+			whereConds = append(whereConds, subQuery)
+		}
+	}
+
+	query := fmt.Sprintf(`%s %s %s %s`,
+		selectClause, fromClause, strings.Join(joinClauses, " "), generateWhereClause(whereConds),
 	)
 
 	if scopeEdge != nil {
@@ -691,7 +699,7 @@ func generateQuery(
 	for _, t := range getTablesFromCycle(cycle) {
 		var keysWithAliases []string
 		for _, k := range t.PrimaryKey {
-			keysWithAliases = append(keysWithAliases, fmt.Sprintf(`"%s"."%s"."%s" as "%s__%s__%s"`, t.Schema, t.Name, k, t.Schema, t.Name, k))
+			keysWithAliases = append(keysWithAliases, fmt.Sprintf(`"%s"."%s"."%s" as "%s"`, t.Schema, t.Name, k, columnAlias(t.Schema, t.Name, k)))
 		}
 		selectKeys = append(selectKeys, keysWithAliases...)
 		if len(t.SubsetConds) > 0 {
@@ -704,7 +712,7 @@ func generateQuery(
 		t := droppedEdge.from.table
 		droppedKeysWithAliases = append(
 			droppedKeysWithAliases,
-			fmt.Sprintf(`%s as "%s__%s__%s"`, k.GetKeyReference(t), t.Schema, t.Name, k.Name),
+			fmt.Sprintf(`%s as "%s"`, k.GetKeyReference(t), columnAlias(t.Schema, t.Name, k.Name)),
 		)
 	}
 	selectKeys = append(selectKeys, droppedKeysWithAliases...)
@@ -713,9 +721,9 @@ func generateQuery(
 	for _, k := range cycle[0].from.table.PrimaryKey {
 		t := cycle[0].from.table
 		pathName := fmt.Sprintf(
-			`ARRAY["%s"."%s"."%s"] AS %s__%s__%s__path`,
+			`ARRAY["%s"."%s"."%s"] AS %s`,
 			t.Schema, t.Name, k,
-			t.Schema, t.Name, k,
+			columnPathAlias(t.Schema, t.Name, k),
 		)
 		initialPathSelectionKeys = append(initialPathSelectionKeys, pathName)
 	}
@@ -751,13 +759,13 @@ func generateQuery(
 
 	recursiveIntegrityChecks := slices.Clone(cycleSubsetConds)
 	recursiveIntegrityChecks = append(recursiveIntegrityChecks, integrityChecks...)
-	recursiveIntegrityCheck := fmt.Sprintf("(%s) AS valid", strings.Join(recursiveIntegrityChecks, " AND "))
+	recursiveIntegrityCheck := generateIntegrityCheckExpr(recursiveIntegrityChecks)
 	recursiveKeys := slices.Clone(selectKeys)
 	for _, k := range cycle[0].from.table.PrimaryKey {
 		t := cycle[0].from.table
 		pathName := fmt.Sprintf(
-			`"%s__%s__%s__path" || ARRAY["%s"."%s"."%s"]`,
-			t.Schema, t.Name, k,
+			`"%s" || ARRAY["%s"."%s"."%s"]`,
+			columnPathAlias(t.Schema, t.Name, k),
 			t.Schema, t.Name, k,
 		)
 		recursiveKeys = append(recursiveKeys, pathName)
@@ -787,9 +795,9 @@ func generateQuery(
 		t := cycle[0].from.table
 
 		recursivePathCheck := fmt.Sprintf(
-			`NOT "%s"."%s"."%s" = ANY("%s"."%s__%s__%s__%s")`,
+			`NOT "%s"."%s"."%s" = ANY("%s"."%s")`,
 			t.Schema, t.Name, k,
-			queryName, t.Schema, t.Name, k, "path",
+			queryName, columnPathAlias(t.Schema, t.Name, k),
 		)
 
 		recursiveWhereConds = append(recursiveWhereConds, recursivePathCheck)
@@ -824,7 +832,7 @@ func generateOverlapQuery(
 	for _, t := range getTablesFromCycle(cycle) {
 		var keysWithAliases []string
 		for _, k := range t.PrimaryKey {
-			keysWithAliases = append(keysWithAliases, fmt.Sprintf(`"%s"."%s"."%s" as "%s__%s__%s"`, t.Schema, t.Name, k, t.Schema, t.Name, k))
+			keysWithAliases = append(keysWithAliases, fmt.Sprintf(`"%s"."%s"."%s" as "%s"`, t.Schema, t.Name, k, columnAlias(t.Schema, t.Name, k)))
 		}
 		selectKeys = append(selectKeys, keysWithAliases...)
 		if len(t.SubsetConds) > 0 {
@@ -837,7 +845,7 @@ func generateOverlapQuery(
 		t := droppedEdge.from.table
 		droppedKeysWithAliases = append(
 			droppedKeysWithAliases,
-			fmt.Sprintf(`%s as "%s__%s__%s"`, k.GetKeyReference(t), t.Schema, t.Name, k.Name),
+			fmt.Sprintf(`%s as "%s"`, k.GetKeyReference(t), columnAlias(t.Schema, t.Name, k.Name)),
 		)
 	}
 	selectKeys = append(selectKeys, droppedKeysWithAliases...)
@@ -846,9 +854,9 @@ func generateOverlapQuery(
 	for _, k := range edges[0].from.table.PrimaryKey {
 		t := edges[0].from.table
 		pathName := fmt.Sprintf(
-			`ARRAY["%s"."%s"."%s"] AS %s__%s__%s__path`,
+			`ARRAY["%s"."%s"."%s"] AS %s`,
 			t.Schema, t.Name, k,
-			t.Schema, t.Name, k,
+			columnPathAlias(t.Schema, t.Name, k),
 		)
 		initialPathSelectionKeys = append(initialPathSelectionKeys, pathName)
 	}
@@ -874,7 +882,7 @@ func generateOverlapQuery(
 
 	integrityChecks := generateIntegrityChecksForNullableEdges(nullabilityMap, edges, overriddenTables)
 	integrityChecks = append(integrityChecks, cycleSubsetConds...)
-	initialIntegrityCheck := fmt.Sprintf("(%s) AS valid", strings.Join(integrityChecks, " AND "))
+	initialIntegrityCheck := generateIntegrityCheckExpr(integrityChecks)
 	initialKeys = append(initialKeys, initialIntegrityCheck)
 	initialSelect := fmt.Sprintf("SELECT %s", strings.Join(initialKeys, ", "))
 
@@ -884,15 +892,15 @@ func generateOverlapQuery(
 		initialSelect, initFromClause, strings.Join(initialJoins, " "), initialWhereClause,
 	)
 
-	recursiveIntegrityCheck := fmt.Sprintf("(%s) AS valid", strings.Join(integrityChecks, " AND "))
+	recursiveIntegrityCheck := generateIntegrityCheckExpr(integrityChecks)
 	recursiveKeys := slices.Clone(selectKeys)
 	for _, k := range edges[0].from.table.PrimaryKey {
 		t := edges[0].from.table
 		//recursivePathSelectionKeys = append(recursivePathSelectionKeys, fmt.Sprintf(`coalesce("%s"."%s"."%s"::TEXT, 'NULL')`, t.Schema, t.Name, k))
 
 		pathName := fmt.Sprintf(
-			`"%s__%s__%s__path" || ARRAY["%s"."%s"."%s"]`,
-			t.Schema, t.Name, k,
+			`"%s" || ARRAY["%s"."%s"."%s"]`,
+			columnPathAlias(t.Schema, t.Name, k),
 			t.Schema, t.Name, k,
 		)
 		recursiveKeys = append(recursiveKeys, pathName)
@@ -922,9 +930,9 @@ func generateOverlapQuery(
 		t := edges[0].from.table
 
 		recursivePathCheck := fmt.Sprintf(
-			`NOT "%s"."%s"."%s" = ANY("%s"."%s__%s__%s__%s")`,
+			`NOT "%s"."%s"."%s" = ANY("%s"."%s")`,
 			t.Schema, t.Name, k,
-			queryName, t.Schema, t.Name, k, "path",
+			queryName, columnPathAlias(t.Schema, t.Name, k),
 		)
 
 		recursiveWhereConds = append(recursiveWhereConds, recursivePathCheck)
@@ -955,7 +963,7 @@ func generateInClauseForOverlap(scopeId int, edges []*Edge, overlap [][]*Edge) s
 		overlapTables = append(overlapTables, getCycleQueryName(scopeId, c, ""))
 	}
 	for _, k := range edges[0].from.table.PrimaryKey {
-		rightTableKey := fmt.Sprintf(`"%s__%s__%s"`, edges[0].from.table.Schema, edges[0].from.table.Name, k)
+		rightTableKey := fmt.Sprintf(`"%s"`, columnAlias(edges[0].from.table.Schema, edges[0].from.table.Name, k))
 		rightTableKeys = append(rightTableKeys, rightTableKey)
 		leftTableKey := fmt.Sprintf(`"%s"."%s"."%s"`, edges[0].from.table.Schema, edges[0].from.table.Name, k)
 		leftTableKeys = append(leftTableKeys, leftTableKey)
@@ -1047,10 +1055,10 @@ func generateIntegrityCheckJoinConds(scopeId int, cycles [][]*Edge) string {
 
 	for _, t := range getTablesFromCycle(cycles[0]) {
 		for _, k := range t.PrimaryKey {
-			key := fmt.Sprintf(`"%s"."%s__%s__%s"`, tableName, t.Schema, t.Name, k)
+			key := fmt.Sprintf(`"%s"."%s"`, tableName, columnAlias(t.Schema, t.Name, k))
 			allPks = append(allPks, key)
 			if t.Oid == table.Oid {
-				pathName := fmt.Sprintf(`"%s"."%s__%s__%s__path"`, tableName, t.Schema, t.Name, k)
+				pathName := fmt.Sprintf(`"%s"."%s"`, tableName, columnPathAlias(t.Schema, t.Name, k))
 				mainTablePks = append(mainTablePks, key)
 				unnestSelection := fmt.Sprintf(`unnest(%s) AS "%s"`, pathName, k)
 				unnestSelections = append(unnestSelections, unnestSelection)
@@ -1088,7 +1096,7 @@ func generateAllTablesValidPkSelection(cycles [][]*Edge, scopeId int, forTable *
 		)
 
 		for _, k := range forTable.PrimaryKey {
-			key := fmt.Sprintf(`"%s"."%s__%s__%s" AS "%s"`, filteredQueryName, forTable.Schema, forTable.Name, k, k)
+			key := fmt.Sprintf(`"%s"."%s" AS "%s"`, filteredQueryName, columnAlias(forTable.Schema, forTable.Name, k), k)
 			selectionKeys = append(selectionKeys, key)
 		}
 

@@ -258,7 +258,7 @@ func (c *Component) getComponentKeys() []string { //nolint: unused
 	for v := range vertexes {
 		table := c.tables[v]
 		for _, key := range table.PrimaryKey {
-			keys = append(keys, fmt.Sprintf(`%s__%s__%s`, table.Schema, table.Name, key))
+			keys = append(keys, columnAlias(table.Schema, table.Name, key))
 		}
 	}
 	return keys

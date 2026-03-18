@@ -36,7 +36,7 @@ func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 		if edge.from.table.Oid == targetTable.Oid {
 			continue
 		}
-		excludedCteQuery := fmt.Sprintf("%s__%s__ids", edge.from.table.Schema, edge.from.table.Name)
+		excludedCteQuery := fmt.Sprintf("__s%d__%s__%s__ids", rootScopeId, edge.from.table.Schema, edge.from.table.Name)
 		excludedCteQueries = append(excludedCteQueries, excludedCteQuery)
 	}
 
@@ -47,14 +47,15 @@ func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 		queries = append(queries, fmt.Sprintf(" %s AS (%s)", item.name, item.query))
 	}
 	var leftTableKeys, rightTableKeys []string
-	rightTableName := fmt.Sprintf("%s__%s__ids", targetTable.Schema, targetTable.Name)
+	rightTableName := fmt.Sprintf("__s%d__%s__%s__ids", rootScopeId, targetTable.Schema, targetTable.Name)
 	for _, key := range targetTable.PrimaryKey {
 		leftTableKeys = append(leftTableKeys, fmt.Sprintf(`"%s"."%s"."%s"`, targetTable.Schema, targetTable.Name, key))
 		rightTableKeys = append(rightTableKeys, fmt.Sprintf(`"%s"."%s"`, rightTableName, key))
 	}
 
 	resultingQuery := fmt.Sprintf(
-		`SELECT * FROM "%s"."%s" WHERE %s IN (SELECT %s FROM "%s")`,
+		`SELECT %s FROM "%s"."%s" WHERE %s IN (SELECT %s FROM "%s")`,
+		targetTable.SelectColumns(),
 		targetTable.Schema,
 		targetTable.Name,
 		fmt.Sprintf("(%s)", strings.Join(leftTableKeys, ",")),
