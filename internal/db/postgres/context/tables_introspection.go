@@ -165,6 +165,18 @@ func getTableConstraints(ctx context.Context, tx pgx.Tx, tableOid toolkit.Oid, v
 				Columns:    constraintColumns,
 				Definition: constraintDefinition,
 			}
+		case 'x':
+			// Exclusion constraint (e.g. EXCLUDE USING gist (...)). The SQL in
+			// TableConstraintsCommonQuery already returns these rows; without this
+			// case the loader aborted with "unknown constraint type x" for any
+			// table that defined one (e.g. tstzrange overlap exclusions).
+			c = toolkit.NewExclusion(
+				constraintSchema,
+				constraintName,
+				constraintDefinition,
+				constraintOid,
+				constraintColumns,
+			)
 		case 'n':
 			// Ignore not null constraint as it's introspected in table definition query.
 			// Before pg18 it was only for domain types, since 18 all null constraints
